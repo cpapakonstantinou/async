@@ -48,9 +48,10 @@
 namespace async
 {
 	// Recommend the number of real cores, for thread pinning.
-	#define REAL_CORES 4
-	static constexpr size_t threads = REAL_CORES; ///< Number of threads to use.
-
+	#ifndef ASYNC_NUM_THREADS
+    	#define ASYNC_NUM_THREADS 4  // default value
+	#endif
+	static constexpr size_t threads = ASYNC_NUM_THREADS; ///< Number of threads to use.
 
 	/**
 	 * \brief Launch an asynchronous task using std::async with forwarded parameters.
@@ -76,6 +77,8 @@ namespace async
 	/**
 	 * \brief Launches a parallel for-each operation across a range using asynchronous tasks.
 	 * 
+	 * Optimized with atomic operations for better performance.
+	 * 
 	 * \tparam I Iterator type
 	 * \tparam F Callable type
 	 * \tparam P Progress callback type
@@ -99,10 +102,11 @@ namespace async
 		auto chunk_size = size / threads;
 		std::vector<std::future<void>> futures(threads);
 
-		std::mutex ex_mutex;
+		alignas(64) std::atomic<bool> abort{false};
+		alignas(64) std::atomic<size_t> completed{0};
+
 		std::exception_ptr ex_ptr = nullptr;
-		std::atomic<bool> abort(false);
-		std::atomic<unsigned> completed(0);
+		std::mutex ex_mutex;
 
 		I chunk_begin = begin;
 
@@ -126,19 +130,23 @@ namespace async
 			auto chunk_len = std::ranges::distance(local_chunk_begin, local_chunk_end);
 			auto idx_offset = i * chunk_len;
 
-			futures[i] = call_async([=, &f, &abort, &ex_mutex, &ex_ptr, &completed, &progress]() mutable {
+			futures[i] = call_async([=, &f, &abort, &ex_ptr, &ex_mutex, &completed, &progress]() mutable 
+			{
 				#ifdef __linux__
 					cpu_set_t cpuset;
 					CPU_ZERO(&cpuset);
 					CPU_SET(i % std::thread::hardware_concurrency(), &cpuset);
-					pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+					pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);					
 				#endif
 
 				try
 				{
 					size_t idx = idx_offset;
-					for (auto it = local_chunk_begin; it != local_chunk_end && !abort.load(); ++it)
+					for (auto it = local_chunk_begin; it != local_chunk_end; ++it)
 					{
+						[[assume(!abort.load(std::memory_order_relaxed))]];
+						if (abort.load(std::memory_order_relaxed)) break;
+
 						if constexpr (std::is_invocable_v<F, decltype(*it), size_t, size_t>)
 							f(*it, idx++, i); // i is the thread id
 						else if constexpr (std::is_invocable_v<F, decltype(*it), size_t>)
@@ -148,16 +156,21 @@ namespace async
 						else
 							static_assert(false, "f must be invocable with (T), (T, size_t) or (T, size_t, size_t)");
 					}
-					++completed;
-					progress(completed);
+					
+					auto prev_completed = completed.fetch_add(1, std::memory_order_relaxed);
+					progress(prev_completed + 1);
 				}
 				catch (...)
 				{
-					std::lock_guard<std::mutex> lock(ex_mutex);
-					if (!ex_ptr)
+					[[assume(!abort.load(std::memory_order_relaxed))]];
+					if (!abort.load(std::memory_order_relaxed))
 					{
-						ex_ptr = std::current_exception();
-						abort.store(true);
+						std::lock_guard<std::mutex> lock(ex_mutex);
+						if (!ex_ptr)
+						{
+							ex_ptr = std::current_exception();
+							abort.store(true, std::memory_order_relaxed);
+						}
 					}
 				}
 			});
@@ -167,19 +180,28 @@ namespace async
 
 		for (auto& fut : futures)
 		{
-			try { fut.get(); }
+			try 
+			{ 
+				fut.get(); 
+			}
 			catch (...)
 			{
-				std::lock_guard<std::mutex> lock(ex_mutex);
-				if (!ex_ptr)
+				[[assume(!abort.load(std::memory_order_relaxed))]];
+				if (!abort.load(std::memory_order_relaxed))
 				{
-					ex_ptr = std::current_exception();
-					abort.store(true);
+					std::lock_guard<std::mutex> lock(ex_mutex);
+					if (!ex_ptr)
+					{
+						ex_ptr = std::current_exception();
+						abort.store(true, std::memory_order_relaxed);
+					}
 				}
 			}
 		}
 
-		if (ex_ptr) std::rethrow_exception(ex_ptr);
+		std::lock_guard<std::mutex> final_lock(ex_mutex);
+		if (ex_ptr) 
+			std::rethrow_exception(ex_ptr);
 	}
 
 	/**
@@ -241,19 +263,21 @@ namespace async
 	}
 
 	/**
-	 * \brief Core async parallel-for kernel using compile-time indexing.
+	 * \brief async for_each kernel using compile-time indexing.
 	 */
 	template <typename T, T N0, T Nn, T Ns = 1, typename F, size_t... Is>
 	inline void 
 	async_for_each_index(F&& f, std::index_sequence<Is...>)
 	{
 		static constexpr size_t chunk_count = sizeof...(Is);
+		
+		alignas(64) std::atomic<bool> abort{false};
+
 		std::exception_ptr ex_ptr = nullptr;
 		std::mutex ex_mutex;
-		std::atomic<bool> abort = false;
 
 		auto futures = std::make_tuple(
-			call_async([=, &f]() 
+			call_async([=, &f, &abort, &ex_ptr, &ex_mutex]() 
 			{
 				#ifdef __linux__
 					cpu_set_t cpuset;
@@ -262,27 +286,56 @@ namespace async
 					pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
 				#endif
 
-				using chunk = typename chunk_of_sequence<T, N0, Nn, Ns, Is, chunk_count>::type;
-				constexpr T offset = chunk_of_sequence<T, N0, Nn, Ns, Is, chunk_count>::chunk_start;
-				for_each_index<T, offset>(chunk{}, f, Is);
+				try
+				{
+					[[assume(!abort.load(std::memory_order_relaxed))]];
+					if (abort.load(std::memory_order_relaxed)) return;
+					
+					using chunk = typename chunk_of_sequence<T, N0, Nn, Ns, Is, chunk_count>::type;
+					constexpr T offset = chunk_of_sequence<T, N0, Nn, Ns, Is, chunk_count>::chunk_start;
+					for_each_index<T, offset>(chunk{}, f, Is);
+				}
+				catch (...)
+				{
+					[[assume(!abort.load(std::memory_order_relaxed))]];
+					if (!abort.load(std::memory_order_relaxed))
+					{
+						std::lock_guard<std::mutex> lock(ex_mutex);
+						if (!ex_ptr)
+						{
+							ex_ptr = std::current_exception();
+							abort.store(true, std::memory_order_relaxed);
+						}
+					}
+				}
 			})...
 		);
 
 		( [&] {
-				try { std::get<Is>(futures).get(); }
+				try 
+				{ 
+					std::get<Is>(futures).get(); 
+				}
 				catch (...) 
 				{
-					std::lock_guard lock(ex_mutex);
-					if (!ex_ptr) 
+					[[assume(!abort.load(std::memory_order_relaxed))]];
+					if (!abort.load(std::memory_order_relaxed))
 					{
-						ex_ptr = std::current_exception();
-						abort.store(true);
+						std::lock_guard<std::mutex> lock(ex_mutex);
+						if (!ex_ptr)
+						{
+							ex_ptr = std::current_exception();
+							abort.store(true, std::memory_order_relaxed);
+						}
 					}
 				}
 		}(), ...);
 
-		if (ex_ptr) std::rethrow_exception(ex_ptr);
+		std::lock_guard<std::mutex> final_lock(ex_mutex);
+		if (ex_ptr) 
+			std::rethrow_exception(ex_ptr);
 	}
+
 	/**
 	 * \brief Public interface for compile-time indexed async loop.
 	 * \tparam T Index type (usually size_t)
