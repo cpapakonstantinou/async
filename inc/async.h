@@ -49,9 +49,44 @@ namespace async
 {
 	// Recommend the number of real cores, for thread pinning.
 	#ifndef ASYNC_NUM_THREADS
-    	#define ASYNC_NUM_THREADS 4  // default value
+		#define ASYNC_NUM_THREADS 4  // default value
 	#endif
+	
+	#ifndef ASYNC_MIN_THREADS
+		#define ASYNC_MIN_THREADS 1  // default value
+	#endif
+
+	#ifndef ASYNC_MAX_THREADS
+		#define ASYNC_MAX_THREADS 64  // default value
+	#endif
+
 	static constexpr size_t threads = ASYNC_NUM_THREADS; ///< Number of threads to use.
+
+	/** 
+	 * \brief runtime support for setting threads with environment variable
+	 * \note this only applies .
+	 * \note  
+	 */
+	inline size_t runtime_threads() 
+	{
+		static size_t _threads = 0;
+		if ( _threads == 0) 
+		{
+			const char* env_async = std::getenv("ASYNC_NUM_THREADS");    
+			if (env_async) 
+			{
+
+				_threads = 
+					std::min(ASYNC_MAX_THREADS, 
+						std::max(ASYNC_MIN_THREADS, std::atoi(env_async)));
+			} 
+			else 
+			{
+				_threads = threads;
+			}
+		}
+		return _threads;
+	}
 
 	/**
 	 * \brief Launch an asynchronous task using std::async with forwarded parameters.
@@ -91,7 +126,7 @@ namespace async
 	template<typename I, typename F, typename P>
 	inline void 
 	async_for_each(I begin, I end, F&& f,
-						size_t threads = std::thread::hardware_concurrency(),
+						size_t threads = runtime_threads(),
 						P&& progress = [](size_t) {})
 	{
 		using difference_type = typename std::iterator_traits<I>::difference_type;
@@ -208,7 +243,8 @@ namespace async
 	 * \brief Overload of async_for_each without progress callback.
 	 */
 	template<typename I, typename F>
-	inline void async_for_each(I begin, I end, F&& f, size_t threads = std::thread::hardware_concurrency()) {
+	inline void async_for_each(I begin, I end, F&& f, size_t threads = runtime_threads()) 
+	{
 		async_for_each(begin, end, std::forward<F>(f), threads, [](size_t) {});
 	}
 

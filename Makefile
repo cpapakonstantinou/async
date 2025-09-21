@@ -29,4 +29,4 @@ install: $(HEADERS)
 uninstall:
 	$(RM) -r $(INSTALLDIR)
 
-.DEFAULT_GOAL=install
+.DEFAULT_GOAL=$(TARGET)
